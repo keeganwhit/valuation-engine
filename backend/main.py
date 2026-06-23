@@ -12,6 +12,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import yfinance as yf
 import math
+import os
+import httpx
 
 # ── App init ──────────────────────────────────────────────────────────────────
 
@@ -32,7 +34,7 @@ app.add_middleware(
         "*",                              # wide-open while prototyping; tighten before launch
     ],
     allow_credentials=True,
-    allow_methods=["GET"],
+    allow_methods=["GET", "POST"],  # POST needed for /api/arbiter
     allow_headers=["*"],
 )
 
@@ -279,6 +281,145 @@ async def valuate(ticker: str = Query(..., description="Stock ticker symbol, e.g
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+# ── Gemini Arbiter Proxy ──────────────────────────────────────────────────────
+# Keeps the GEMINI_API_KEY server-side — never exposed to the browser.
+# Set this in your Render dashboard: Environment → GEMINI_API_KEY = AIza...
+
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+
+# Gemini generateContent endpoint (gemini-2.0-flash is fast and cheap)
+GEMINI_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/models/"
+    "gemini-2.0-flash:generateContent?key={key}"
+)
+
+ARBITER_SYSTEM_PROMPT = """You are the Head of an Institutional Investment Committee. You will receive calculated valuation metrics for a publicly traded company and must deliver a concise, authoritative analysis.
+
+Your task has two parts:
+
+PART 1 — MODEL SELECTION
+On the very first line of your response, output exactly:
+BEST_MODEL: <model>
+Where <model> is exactly one of: multiples | dcf | graham
+
+Selection rules:
+- High-growth / SaaS / asset-light companies (software, cloud, platform): anchor to DCF — future cash flow capture is primary.
+- Mature, capital-intensive, predictable businesses (utilities, industrials, consumer staples, banks): anchor to Multiples or Graham — current earnings power dominates.
+- Cyclical, unprofitable, or turnaround companies: pick the least-broken model but explicitly critique all three.
+- If a model returned N/A (unavailable data), do not select it.
+
+PART 2 — COMMITTEE VERDICT
+Write a concise markdown analysis structured into exactly three sections:
+
+### 🎯 Selected Valuation Anchor
+2–3 sentences. Name the chosen model, the implied price, and why it fits this company's business model. Reference the actual numbers.
+
+### ⚖️ Methodology Trade-off Analysis
+2–3 sentences. Explain why the other two models are less reliable for this specific company. Be specific about the structural limitation.
+
+### 💡 Core Strategic Verdict
+2–3 sentences. State clearly whether the stock appears overvalued, undervalued, or fairly valued relative to your chosen anchor. Include a confidence level (High / Medium / Low) and one key risk to the thesis.
+
+Tone: institutional, precise, direct. No filler language."""
+
+
+def build_user_content(payload: dict) -> str:
+    """Format the valuation payload into a prompt for the Gemini model."""
+    m = payload.get("market", {})
+    v = payload.get("valuations", {})
+    i = payload.get("inputs", {})
+    meta = payload.get("meta", {})
+
+    return (
+        f"Analyze {meta.get('ticker')} ({meta.get('company_name')}, Sector: {meta.get('sector')}):\n\n"
+        f"Current market price:      ${m.get('current_price')}\n"
+        f"Shares outstanding:        {m.get('shares_outstanding')}\n"
+        f"Trailing EPS:              ${m.get('trailing_eps', 'N/A')}\n"
+        f"EPS growth assumed:        {m.get('eps_growth_rate_pct')}%\n\n"
+        f"Multiples valuation (18× P/E):   ${v.get('multiples_price', 'N/A')}\n"
+        f"DCF intrinsic valuation:         ${v.get('dcf_price', 'N/A')}\n"
+        f"Graham margin of safety:         ${v.get('graham_price', 'N/A')}\n\n"
+        f"DCF inputs: {i.get('dcf_growth_rate_pct')}% growth rate, "
+        f"{i.get('dcf_discount_rate_pct')}% discount rate, {i.get('dcf_years')}-year horizon."
+    )
+
+
+@app.post("/api/arbiter")
+async def arbiter(body: dict):
+    """
+    Proxies the AI arbitration call to Gemini server-side.
+    Expects: { "payload": { ...full /api/valuate response... } }
+    Returns: { "verdict": "...", "best_model": "dcf|multiples|graham" }
+
+    The GEMINI_API_KEY never leaves the server — the browser only calls this endpoint.
+    """
+    if not GEMINI_API_KEY:
+        raise HTTPException(
+            status_code=500,
+            detail="GEMINI_API_KEY environment variable is not set on the server."
+        )
+
+    payload = body.get("payload")
+    if not payload:
+        raise HTTPException(status_code=400, detail="Request body must include a 'payload' key.")
+
+    user_text = build_user_content(payload)
+
+    # Gemini REST API — combine system prompt + user message in the contents array.
+    # gemini-2.0-flash supports a system_instruction field at the top level.
+    gemini_body = {
+        "system_instruction": {
+            "parts": [{"text": ARBITER_SYSTEM_PROMPT}]
+        },
+        "contents": [
+            {
+                "role": "user",
+                "parts": [{"text": user_text}]
+            }
+        ],
+        "generationConfig": {
+            "maxOutputTokens": 1024,
+            "temperature": 0.3,   # Low temperature = consistent, analytical tone
+        },
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            res = await client.post(
+                GEMINI_URL.format(key=GEMINI_API_KEY),
+                json=gemini_body,
+                headers={"Content-Type": "application/json"},
+            )
+            res.raise_for_status()
+            data = res.json()
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Gemini API returned {e.response.status_code}: {e.response.text}"
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Gemini API call failed: {str(e)}")
+
+    # Extract text from Gemini's response structure
+    try:
+        raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
+    except (KeyError, IndexError):
+        raise HTTPException(status_code=502, detail="Unexpected Gemini response structure.")
+
+    # Parse the BEST_MODEL tag from the first line
+    best_model = None
+    model_match_line = raw_text.strip().split("\n")[0]
+    for candidate in ("multiples", "dcf", "graham"):
+        if candidate in model_match_line.lower():
+            best_model = candidate
+            break
+
+    # Strip the BEST_MODEL tag line before returning the display text
+    verdict_text = raw_text.replace(model_match_line, "").strip()
+
+    return {"verdict": verdict_text, "best_model": best_model}
 
 
 # ── Local dev entrypoint ──────────────────────────────────────────────────────
